@@ -32,6 +32,8 @@ use tokenstream::{TokenTree, TokenStream};
 use util::small_vector::SmallVector;
 use visit::Visitor;
 
+use std::cell::Cell;
+use std::collections::HashMap;
 use std::mem;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -154,6 +156,9 @@ pub struct Invocation {
     pub kind: InvocationKind,
     expansion_kind: ExpansionKind,
     expansion_data: ExpansionData,
+    parent: Option<Mark>,
+    unexpanded_children: Cell<u32>,
+
 }
 
 pub enum InvocationKind {
@@ -221,63 +226,85 @@ impl<'a, 'b> MacroExpander<'a, 'b> {
         let orig_expansion_data = self.cx.current_expansion.clone();
         self.cx.current_expansion.depth = 0;
 
-        let (expansion, mut invocations) = self.collect_invocations(expansion);
+        let (expansion, mut invocations, mut worklist) = self.collect_invocations(expansion);
         self.resolve_imports();
-        invocations.reverse();
+        worklist.reverse();
 
         let mut expansions = Vec::new();
-        let mut undetermined_invocations = Vec::new();
+        let mut undetermined_worklist = Vec::new();
         let (mut progress, mut force) = (false, !self.monotonic);
         loop {
-            let invoc = if let Some(invoc) = invocations.pop() {
-                invoc
+            let invoc_mark = if let Some(mark) = worklist.pop() {
+                mark
             } else {
                 self.resolve_imports();
-                if undetermined_invocations.is_empty() { break }
-                invocations = mem::replace(&mut undetermined_invocations, Vec::new());
+                if undetermined_worklist.is_empty() { break }
+                worklist = mem::replace(&mut undetermined_worklist, Vec::new());
                 force = !mem::replace(&mut progress, false);
                 continue
             };
 
-            let scope =
-                if self.monotonic { invoc.expansion_data.mark } else { orig_expansion_data.mark };
-            let resolution = match invoc.kind {
-                InvocationKind::Bang { ref mac, .. } => {
-                    self.cx.resolver.resolve_macro(scope, &mac.node.path, force)
+            {
+                let invoc = invocations.remove(&invoc_mark)
+                                       .expect("Invocation for this mark missing");
+                let scope =
+                    if self.monotonic { invoc.expansion_data.mark } else { orig_expansion_data.mark };
+                let resolution = match invoc.kind {
+                    InvocationKind::Bang { ref mac, .. } => {
+                        self.cx.resolver.resolve_macro(scope, &mac.node.path, force)
+                    }
+                    InvocationKind::Attr { ref attr, .. } => {
+                        let ident = Ident::with_empty_ctxt(attr.name());
+                        let path = ast::Path::from_ident(attr.span, ident);
+                        self.cx.resolver.resolve_macro(scope, &path, force)
+                    }
+                };
+                let ext = match resolution {
+                    Ok(ext) => match *ext {
+                        SyntaxExtension::CustomDerive(..)
+                              if invoc.unexpanded_children.get() > 0 => {
+                            undetermined_worklist.push(invoc_mark);
+                            invocations.insert(invoc_mark, invoc);
+                            continue
+                        },
+                        _ => Some(ext)
+                    },
+                    Err(Determinacy::Determined) => None,
+                    Err(Determinacy::Undetermined) => {
+                        undetermined_worklist.push(invoc_mark);
+                        invocations.insert(invoc_mark, invoc);
+                        continue
+                    }
+                };
+
+                progress = true;
+                let ExpansionData { depth, mark, .. } = invoc.expansion_data;
+                self.cx.current_expansion = invoc.expansion_data.clone();
+                if let Some(parent_mark) = invoc.parent {
+                    let parent = invocations.get_mut(&parent_mark).unwrap();
+                    // if (parent.unexpanded_children.get() == 0) {
+                    //     panic!("Unexpanded children would be negative");
+                    // }
+                    *parent.unexpanded_children.get_mut() -= 1;
                 }
-                InvocationKind::Attr { ref attr, .. } => {
-                    let ident = Ident::with_empty_ctxt(attr.name());
-                    let path = ast::Path::from_ident(attr.span, ident);
-                    self.cx.resolver.resolve_macro(scope, &path, force)
+
+                self.cx.current_expansion.mark = scope;
+                let expansion = match ext {
+                    Some(ext) => self.expand_invoc(invoc, ext),
+                    None => invoc.expansion_kind.dummy(invoc.span()),
+                };
+
+                let (expansion, new_invocations, new_worklist) = self.collect_invocations(expansion);
+
+
+                if expansions.len() < depth {
+                    expansions.push(Vec::new());
                 }
-            };
-            let ext = match resolution {
-                Ok(ext) => Some(ext),
-                Err(Determinacy::Determined) => None,
-                Err(Determinacy::Undetermined) => {
-                    undetermined_invocations.push(invoc);
-                    continue
+                expansions[depth - 1].push((mark, expansion));
+                if !self.cx.ecfg.single_step {
+                    invocations.extend(new_invocations.into_iter());
+                    worklist.extend(new_worklist.into_iter().rev());
                 }
-            };
-
-            progress = true;
-            let ExpansionData { depth, mark, .. } = invoc.expansion_data;
-            self.cx.current_expansion = invoc.expansion_data.clone();
-
-            self.cx.current_expansion.mark = scope;
-            let expansion = match ext {
-                Some(ext) => self.expand_invoc(invoc, ext),
-                None => invoc.expansion_kind.dummy(invoc.span()),
-            };
-
-            let (expansion, new_invocations) = self.collect_invocations(expansion);
-
-            if expansions.len() < depth {
-                expansions.push(Vec::new());
-            }
-            expansions[depth - 1].push((mark, expansion));
-            if !self.cx.ecfg.single_step {
-                invocations.extend(new_invocations.into_iter().rev());
             }
         }
 
@@ -301,7 +328,7 @@ impl<'a, 'b> MacroExpander<'a, 'b> {
         }
     }
 
-    fn collect_invocations(&mut self, expansion: Expansion) -> (Expansion, Vec<Invocation>) {
+    fn collect_invocations(&mut self, expansion: Expansion) -> (Expansion, HashMap<Mark, Invocation>, Vec<Mark>) {
         let result = {
             let mut collector = InvocationCollector {
                 cfg: StripUnconfigured {
@@ -310,10 +337,11 @@ impl<'a, 'b> MacroExpander<'a, 'b> {
                     features: self.cx.ecfg.features,
                 },
                 cx: self.cx,
-                invocations: Vec::new(),
+                invocations: HashMap::new(),
+                worklist: Vec::new(),
                 monotonic: self.monotonic,
             };
-            (expansion.fold_with(&mut collector), collector.invocations)
+            (expansion.fold_with(&mut collector), collector.invocations, collector.worklist)
         };
 
         if self.monotonic {
@@ -561,7 +589,8 @@ impl<'a> Parser<'a> {
 struct InvocationCollector<'a, 'b: 'a> {
     cx: &'a mut ExtCtxt<'b>,
     cfg: StripUnconfigured<'a>,
-    invocations: Vec<Invocation>,
+    invocations: HashMap<Mark, Invocation>,
+    worklist: Vec<Mark>,
     monotonic: bool,
 }
 
@@ -577,7 +606,7 @@ macro_rules! fully_configure {
 impl<'a, 'b> InvocationCollector<'a, 'b> {
     fn collect(&mut self, expansion_kind: ExpansionKind, kind: InvocationKind) -> Expansion {
         let mark = Mark::fresh();
-        self.invocations.push(Invocation {
+        self.invocations.insert(mark, Invocation {
             kind: kind,
             expansion_kind: expansion_kind,
             expansion_data: ExpansionData {
@@ -585,7 +614,10 @@ impl<'a, 'b> InvocationCollector<'a, 'b> {
                 depth: self.cx.current_expansion.depth + 1,
                 ..self.cx.current_expansion.clone()
             },
+            parent: Some(self.cx.current_expansion.mark),
+            unexpanded_children: Cell::new(0),
         });
+        self.worklist.push(mark);
         placeholder(expansion_kind, mark.as_placeholder_id())
     }
 
